@@ -3,6 +3,8 @@
 #include "dwarf.h"
 #include "dwarf_error.h"
 
+#include "libdwarf-wrapper.h"
+
 #include <iostream>
 #include <optional>
 #include <stack>
@@ -10,35 +12,46 @@
 
 using namespace std;
 
+using TypeNameFilter = optional<char*>;
+// There is no particular reason to choose DW_TAG_array_type for the
+// decltype expression, it was just the first one and the assumption
+// is that all DW_TAG will be of the same type.
+using DwarfTagType = decltype<DW_TAG_array_type>;
+using DwarfTagFilter = vector<DwarfTagType>;
+
 const char* unknown_struct_name_literal = "unknown_struct";
+
+// A vector of DW_TAG values we care about.
+DwarfTagFilter tag_filter =
+    {
+        DW_TAG_class_type,
+        DW_TAG_structure_type
+    };
+
+
+std::optional<const char*> getTypeNameForMemberDie(Dwarf_Debug dw_dbg, Dwarf_Die dw_die) {
+    Dwarf_Attribute dw_attr;
+    Dwarf_Error dw_err;
+    Dwarf_Off dw_offset;
+    Dwarf_Die type_die;
+    char *dbg_typename = nullptr;
+
+    // Severe abuse of short circuiting booleans (later functions
+    // have dependencies on earlier functions)
+    if (!dwarf_attr(dw_die, DW_AT_type, &dw_attr, &dw_err) &&
+        !dwarf_global_formref(dw_attr, &dw_offset, &dw_err) &&
+        !dwarf_offdie_b(dw_dbg, dw_offset, true, &type_die, &dw_err) &&
+        !dwarf_diename(type_die, (char **)&dbg_typename, &dw_err)) {
+        return dbg_typename;
+    }
+    return std::nullopt;
+}
 
 struct DieProcessingFunction {
     // This stack indicates whether we are inside a struct.  The
     // values indicates the level in the DIE tree, and is for testing
     // when the struct ends.
     stack<int, vector<int>> structs_defined_at_level;
-    // This serves the same purpose, but we need to store the name of
-    // each namespace, as well as iterate through it, rather than just
-    // looking at the top.
-    vector<pair<string, int>> namespaces;
-
-    std::optional<const char*> getTypeNameForMemberDie(Dwarf_Debug dw_dbg, Dwarf_Die dw_die) {
-        Dwarf_Attribute dw_attr;
-        Dwarf_Error dw_err;
-        Dwarf_Off dw_offset;
-        Dwarf_Die type_die;
-        char *dbg_typename = nullptr;
-
-        // Severe abuse of short circuiting booleans (later functions
-        // have dependencies on earlier functions)
-        if (!dwarf_attr(dw_die, DW_AT_type, &dw_attr, &dw_err) &&
-            !dwarf_global_formref(dw_attr, &dw_offset, &dw_err) &&
-            !dwarf_offdie_b(dw_dbg, dw_offset, true, &type_die, &dw_err) &&
-            !dwarf_diename(type_die, (char **)&dbg_typename, &dw_err)) {
-            return dbg_typename;
-        }
-        return std::nullopt;
-    }
 
     bool operator()(Dwarf_Debug dw_dbg, Dwarf_Die dw_die, int level) {
         Dwarf_Half dw_tag;
@@ -54,15 +67,6 @@ struct DieProcessingFunction {
             }
             cout << "};" << endl;
             structs_defined_at_level.pop();
-        }
-
-        // Same for namespaces.
-        if (namespaces.size() > 0 && level == namespaces.back().second) {
-            for (int i = 0; i < level; ++i) {
-                cout << "\t";
-            }
-            cout << "}" << endl;
-            namespaces.pop_back();
         }
 
         auto dwarfRet = dwarf_tag(dw_die, &dw_tag, &dw_err);
@@ -85,11 +89,6 @@ struct DieProcessingFunction {
             // cout << "error: " << dw_err << endl;
         }
 
-        if (dw_tag == DW_TAG_namespace) {
-            namespaces.push_back(make_pair(diename, level));
-            return true;
-        }
-
         if (dw_tag == DW_TAG_structure_type) {
             // make sure we're at a defining declaration by checking
             // for DW_AT_declaration, which is for non-defining decls.
@@ -103,11 +102,9 @@ struct DieProcessingFunction {
             for (int i = 0; i < level; ++i) {
                 cout << "\t";
             }
-            cout << "struct ";
-            for (const auto& x : namespaces) {
-                cout << x.first << "::";
-            }
-            cout << diename << " { ";
+
+            cout << "struct " << diename << " { ";
+
             dwarfRet = dwarf_attr(dw_die, DW_AT_decl_file, &dw_attr, &dw_err);
             if (dwarfRet != DW_DLV_OK) {
                 cout << "// no file index information";
@@ -119,11 +116,11 @@ struct DieProcessingFunction {
             return true;
 
         } else if (dw_tag == DW_TAG_member) {
+            cout << dw_die << endl;
             for (int i = 0; i < level; ++i) {
                 cout << "\t";
             }
-            auto typeName = getTypeNameForMemberDie(dw_dbg, dw_die);
-            cout << typeName.value_or("unknown") << " ";
+            cout << getTypeNameForMemberDie(dw_dbg, dw_die).value_or("unknown") << " ";
             cout << diename << ";" << endl;
         }
         //        cout << endl;
@@ -132,12 +129,19 @@ struct DieProcessingFunction {
 };
 
 template<typename Fn>
-int VisitDieTree(Dwarf_Debug dw_dbg, Dwarf_Die dw_die, Fn DieFunction, int level);
+int VisitDieTree(Dwarf_Debug dw_dbg,
+                 Dwarf_Die dw_die,
+                 Fn DieFunction,
+                 TypeNameFilter typeNameFilter,
+                 DwarfTagFilter tag_filter,
+                 int level);
 
 // Precondition: dw_dbg should have just had dwarf_next_cu_header_d called.
 template<typename Fn>
 int VisitDIEsOfCU(Dwarf_Debug dw_dbg,
-                  Fn DieFunction) {
+                  Fn DieFunction,
+                  TypeNameFilter typeNameFilter,
+                  DwarfTagFilter tag_filter) {
 
     Dwarf_Die dw_die;
     Dwarf_Error dw_err;
@@ -149,17 +153,41 @@ int VisitDIEsOfCU(Dwarf_Debug dw_dbg,
                                        &dw_err);
 
     // We want a pre-order, depth first search traversal.
-    return VisitDieTree(dw_dbg, dw_die, DieFunction, 0);
+    return VisitDieTree(dw_dbg,
+                        dw_die,
+                        DieFunction,
+                        typeNameFilter,
+                        tag_filter,
+                        0);
 }
 
 template<typename Fn>
-int VisitDieTree(Dwarf_Debug dw_dbg, Dwarf_Die dw_die, Fn DieFunction, int level) {
+int VisitDieTree(Dwarf_Debug dw_dbg,
+                 Dwarf_Die dw_die,
+                 Fn DieFunction,
+                 TypeNameFilter typeNameFilter,
+                 DwarfTagFilter tag_filter,
+                 int level) {
+
     Dwarf_Die child_die;
     Dwarf_Error dw_err;
     int dw_ret;
     int nodes_processed = 0;
+    Dwarf_Attribute dw_attr;
 
     do {
+        
+        if (typeNameFilter && !dwarf_attr(dw_die, DW_AT_type, &dw_attr, &dw_err)) {
+            auto dieTypeName = getTypeNameForMemberDie(dw_dbg, dw_die);
+            cout << "comparing " << (dieTypeName ? dieTypeName.value() : "no value") << " & " << typeNameFilter.value() << endl;
+            if (!dieTypeName || strcmp(dieTypeName.value(), typeNameFilter.value())) {
+                dw_ret = dwarf_siblingof_b(dw_dbg, dw_die, true, &dw_die, &dw_err);
+                if (dw_ret == DW_DLV_NO_ENTRY) {
+                    break;
+                }
+                continue;
+            }
+        }
         // Process root node of our tree.
         if (!DieFunction(dw_dbg, dw_die, level)) {
 
@@ -177,10 +205,9 @@ int VisitDieTree(Dwarf_Debug dw_dbg, Dwarf_Die dw_die, Fn DieFunction, int level
 
         do {
 
-            VisitDieTree(dw_dbg, child_die, DieFunction, level + 1);
+            VisitDieTree(dw_dbg, child_die, DieFunction, typeNameFilter, level + 1);
 
             dw_ret = dwarf_siblingof_b(dw_dbg, child_die, true, &child_die, &dw_err);
-
         } while(dw_ret != DW_DLV_NO_ENTRY);
 
         dw_ret = dwarf_siblingof_b(dw_dbg, dw_die, true, &dw_die, &dw_err);
@@ -191,28 +218,26 @@ int VisitDieTree(Dwarf_Debug dw_dbg, Dwarf_Die dw_die, Fn DieFunction, int level
 }
 
 int main(int argc, char* argv[]) {
-    char output_path[1024];
+    string output_path;
     Dwarf_Debug dw_dbg;
     Dwarf_Error dw_err = 0x0;
-    char typenameFilter[1024];
-
-    auto dwarfRead = dwarf_init_path(argv[1],
-                                     output_path,
-                                     1024,
-                                     DW_GROUPNUMBER_ANY,
-                                     nullptr,
-                                     nullptr,
-                                     &dw_dbg,
-                                     &dw_err);
+    TypeNameFilter typeNameFilter = nullopt;
 
     if (argc == 3) {
-      strcpy(typenameFilter, argv[2]);
-      cout << "Filtering by type " << typenameFilter << endl;
+        typeNameFilter = argv[2];
+        cout << "Filtering by type " << typeNameFilter.value() << endl;
     }
 
-    // cout << dwarfRead << endl;
-    // cout << dw_err << endl;
-    // cout << output_path << endl;
+    output_path.reserve(1024);
+    if (!readDwarfFile(argv[1],
+                       output_path,
+                       &dw_dbg,
+                       &dw_err)) {
+        cout << "Error opening DWARF file " << argv[1] << endl;
+        return 1;
+    } else {
+        cout << "DWARF file opened as: " output_path << endl;
+    }
 
     Dwarf_Unsigned cu_header_length;
     Dwarf_Half     version;
@@ -225,26 +250,28 @@ int main(int argc, char* argv[]) {
     Dwarf_Unsigned dw_next_cu_header_offset;
     Dwarf_Half     dw_header_cu_type;
 
-    dwarfRead = dwarf_next_cu_header_d(dw_dbg,
-                                       true,
-                                       &cu_header_length,
-                                       &version,
-                                       &abbrev_offset,
-                                       &dw_address_size,
-                                       &dw_length_size,
-                                       &dw_extension_size,
-                                       &dw_type_signature,
-                                       &dw_typeoffset,
-                                       &dw_next_cu_header_offset,
-                                       &dw_header_cu_type,
-                                       &dw_err);
+    int dwarfRead = dwarf_next_cu_header_d(dw_dbg,
+                                           true,
+                                           &cu_header_length,
+                                           &version,
+                                           &abbrev_offset,
+                                           &dw_address_size,
+                                           &dw_length_size,
+                                           &dw_extension_size,
+                                           &dw_type_signature,
+                                           &dw_typeoffset,
+                                           &dw_next_cu_header_offset,
+                                           &dw_header_cu_type,
+                                           &dw_err);
 
     while (dwarfRead != DW_DLV_NO_ENTRY) {
         cout << dwarfRead << endl;
         cout << dw_err << endl;
         cout << "Dwarf version: " << version << endl;
 
-        VisitDIEsOfCU(dw_dbg, DieProcessingFunction());
+        VisitDIEsOfCU(dw_dbg,
+                      DieProcessingFunction(),
+                      typeNameFilter);
 
         dwarfRead = dwarf_next_cu_header_d(dw_dbg,
                                            true,
